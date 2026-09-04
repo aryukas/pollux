@@ -1,262 +1,310 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from io import BytesIO
-from typing import Any
+from pathlib import Path
+from typing import Dict, List
 
 from pypdf import PdfReader
 
 
-STATEMENT_KEYWORDS = {
-    "balance_sheet": (
+FINANCIAL_STATEMENT_KEYWORDS = {
+    "balance_sheet": [
         "balance sheet",
         "statement of financial position",
-        "statement of financial condition",
-    ),
-    "income_statement": (
-        "income statement",
-        "statement of income",
-        "statement of operations",
+    ],
+    "income_statement": [
+        "profit and loss",
+        "profit & loss",
         "statement of profit and loss",
-        "profit and loss statement",
-        "profit & loss statement",
-        "statement of comprehensive income",
-    ),
-    "cash_flow_statement": (
+        "income statement",
+    ],
+    "cash_flow_statement": [
         "cash flow statement",
+        "cash flows from",
         "statement of cash flows",
-        "statement of cash flow",
-    ),
+    ],
 }
 
 
-CASH_FLOW_SECTION_KEYWORDS = (
-    "cash flows from operating activities",
-    "cash flow from operating activities",
-    "cash flows from investing activities",
-    "cash flow from investing activities",
-    "cash flows from financing activities",
-    "cash flow from financing activities",
-    "net increase in cash",
-    "net decrease in cash",
-    "net change in cash",
-    "cash and cash equivalents",
-)
+@dataclass
+class AttachmentInfo:
+    name: str
+    size_bytes: int
+    is_pdf: bool
 
 
-def _normalise_text(text: str) -> str:
-    """
-    Normalise extracted PDF text for reliable matching.
-    """
+@dataclass
+class PDFInspectionResult:
+    file_name: str
+    page_count: int
+    has_outline: bool
+
+    native_text_pages: Dict[str, List[int]] = field(default_factory=dict)
+
+    attachments: List[AttachmentInfo] = field(default_factory=list)
+
+    financial_statement_attachment: str | None = None
+
+    attachment_page_count: int | None = None
+
+    attachment_native_text_pages: Dict[str, List[int]] = field(
+        default_factory=dict
+    )
+
+
+def normalize_text(text: str) -> str:
     return " ".join(text.lower().split())
 
 
-def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
-    """
-    Return True when at least one keyword is present.
-    """
-    return any(keyword in text for keyword in keywords)
-
-
-def _classify_page(text: str) -> list[str]:
-    """
-    Identify likely financial statement types on a page.
-
-    Cash Flow Statement detection uses both:
-    - a statement title
-    - characteristic cash-flow sections
-    """
-    normalised_text = _normalise_text(text)
-
-    matches: list[str] = []
-
-    # Balance Sheet
-    if _contains_any(
-        normalised_text,
-        STATEMENT_KEYWORDS["balance_sheet"],
-    ):
-        matches.append("balance_sheet")
-
-    # Income Statement
-    if _contains_any(
-        normalised_text,
-        STATEMENT_KEYWORDS["income_statement"],
-    ):
-        matches.append("income_statement")
-
-    # Cash Flow Statement
-    has_cash_flow_title = _contains_any(
-        normalised_text,
-        STATEMENT_KEYWORDS["cash_flow_statement"],
-    )
-
-    cash_flow_sections = [
-        keyword
-        for keyword in CASH_FLOW_SECTION_KEYWORDS
-        if keyword in normalised_text
-    ]
-
-    # A page is considered a likely Cash Flow Statement page when:
-    # 1. It contains a Cash Flow Statement title, OR
-    # 2. It contains multiple characteristic cash-flow sections.
-    if has_cash_flow_title or len(cash_flow_sections) >= 2:
-        matches.append("cash_flow_statement")
-
-    return matches
-
-
-def _extract_outline(reader: PdfReader) -> list[dict[str, Any]]:
-    """
-    Extract PDF bookmarks/outlines.
-
-    Returns a lightweight representation containing:
-    - bookmark title
-    - target page when available
-    """
-    outline_items: list[dict[str, Any]] = []
-
-    try:
-        outline = reader.outline
-    except Exception:
-        return outline_items
-
-    def process_items(items: list[Any], level: int = 0) -> None:
-        for item in items:
-            if isinstance(item, list):
-                process_items(item, level + 1)
-                continue
-
-            title = getattr(item, "title", None)
-
-            if not title:
-                continue
-
-            try:
-                page_number = reader.get_destination_page_number(item) + 1
-            except Exception:
-                page_number = None
-
-            outline_items.append(
-                {
-                    "title": str(title),
-                    "page": page_number,
-                    "level": level,
-                }
-            )
-
-    process_items(outline)
-
-    return outline_items
-
-
-def _find_statement_pages_from_outline(
-    outline: list[dict[str, Any]],
-) -> dict[str, list[int]]:
-    """
-    Identify financial statement pages from PDF bookmarks.
-    """
-    detected: dict[str, list[int]] = {
+def detect_statements(reader: PdfReader) -> Dict[str, List[int]]:
+    detected = {
         "balance_sheet": [],
         "income_statement": [],
         "cash_flow_statement": [],
     }
 
-    for item in outline:
-        title = _normalise_text(item["title"])
-        page = item["page"]
+    for page_number, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
 
-        if page is None:
-            continue
+        text = normalize_text(text)
 
-        if _contains_any(
-            title,
-            STATEMENT_KEYWORDS["balance_sheet"],
-        ):
-            detected["balance_sheet"].append(page)
-
-        if _contains_any(
-            title,
-            STATEMENT_KEYWORDS["income_statement"],
-        ):
-            detected["income_statement"].append(page)
-
-        if _contains_any(
-            title,
-            STATEMENT_KEYWORDS["cash_flow_statement"],
-        ):
-            detected["cash_flow_statement"].append(page)
+        for statement_type, keywords in FINANCIAL_STATEMENT_KEYWORDS.items():
+            if any(keyword in text for keyword in keywords):
+                detected[statement_type].append(page_number)
 
     return detected
 
 
-def inspect_pdf(content: bytes) -> dict[str, Any]:
-    """
-    Inspect a PDF without OCR.
+def get_attachment_bytes(reader: PdfReader, attachment_name: str) -> bytes:
+    attachments = reader.attachments
 
-    The inspector checks:
+    data = attachments[attachment_name]
 
-    1. PDF page count
-    2. PDF bookmarks/outlines
-    3. Native PDF text
-    4. Financial statement titles
-    5. Characteristic Cash Flow Statement sections
+    # pypdf versions may expose attachment data slightly differently.
+    if isinstance(data, bytes):
+        return data
 
-    OCR is intentionally NOT used here.
-    """
+    if isinstance(data, list):
+        if not data:
+            return b""
+
+        first_item = data[0]
+
+        if isinstance(first_item, bytes):
+            return first_item
+
+        if isinstance(first_item, tuple) and len(first_item) >= 2:
+            return first_item[1]
+
+    if isinstance(data, tuple) and len(data) >= 2:
+        return data[1]
+
+    raise TypeError(
+        f"Unsupported attachment data format for: {attachment_name}"
+    )
+
+
+def is_pdf_attachment(name: str, content: bytes) -> bool:
+    extension = Path(name).suffix.lower()
+
+    if extension == ".pdf":
+        return True
+
+    return content.startswith(b"%PDF")
+
+
+def choose_financial_statement_attachment(
+    attachments: List[AttachmentInfo],
+) -> str | None:
+
+    # Strongest signal: filename explicitly indicates annual report /
+    # financial statements.
+    preferred_keywords = [
+        "ar_fs",
+        "financial_statement",
+        "financial_statements",
+        "annual_report",
+        "annualreport",
+    ]
+
+    for attachment in attachments:
+        name = attachment.name.lower()
+
+        if not attachment.is_pdf:
+            continue
+
+        if any(keyword in name for keyword in preferred_keywords):
+            return attachment.name
+
+    # Secondary signal: filenames containing financial/report terminology.
+    secondary_keywords = [
+        "financial",
+        "statement",
+        "accounts",
+        "report",
+    ]
+
+    for attachment in attachments:
+        name = attachment.name.lower()
+
+        if not attachment.is_pdf:
+            continue
+
+        if any(keyword in name for keyword in secondary_keywords):
+            return attachment.name
+
+    return None
+
+
+def inspect_pdf(file_path: str | Path) -> PDFInspectionResult:
+    path = Path(file_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"PDF not found: {path}")
+
+    with path.open("rb") as file:
+        content = file.read()
+
+    return inspect_pdf_bytes(
+        content=content,
+        file_name=path.name,
+    )
+
+
+def inspect_pdf_bytes(
+    content: bytes,
+    file_name: str = "uploaded.pdf",
+) -> PDFInspectionResult:
+
     reader = PdfReader(BytesIO(content))
 
     page_count = len(reader.pages)
 
-    outline = _extract_outline(reader)
+    has_outline = bool(reader.outline)
 
-    outline_statements = _find_statement_pages_from_outline(
-        outline
+    native_text_pages = detect_statements(reader)
+
+    attachment_infos: List[AttachmentInfo] = []
+
+    for name in reader.attachments.keys():
+        try:
+            attachment_content = get_attachment_bytes(reader, name)
+        except Exception:
+            attachment_content = b""
+
+        attachment_infos.append(
+            AttachmentInfo(
+                name=name,
+                size_bytes=len(attachment_content),
+                is_pdf=is_pdf_attachment(
+                    name,
+                    attachment_content,
+                ),
+            )
+        )
+
+    selected_attachment = choose_financial_statement_attachment(
+        attachment_infos
     )
 
-    pages: list[dict[str, Any]] = []
+    attachment_page_count = None
+    attachment_native_text_pages: Dict[str, List[int]] = {}
 
-    text_statements: dict[str, list[int]] = {
-        "balance_sheet": [],
-        "income_statement": [],
-        "cash_flow_statement": [],
-    }
-
-    for page_number, page in enumerate(
-        reader.pages,
-        start=1,
-    ):
-        text = page.extract_text() or ""
-
-        statements = _classify_page(text)
-
-        for statement in statements:
-            text_statements[statement].append(page_number)
-
-        pages.append(
-            {
-                "page": page_number,
-                "text": text,
-                "text_available": bool(text.strip()),
-                "statements": statements,
-            }
+    if selected_attachment:
+        attachment_content = get_attachment_bytes(
+            reader,
+            selected_attachment,
         )
 
-    # Combine evidence from bookmarks and page text.
-    combined_statements: dict[str, list[int]] = {}
+        attachment_reader = PdfReader(BytesIO(attachment_content))
 
-    for statement_type in text_statements:
-        combined_pages = set(
-            outline_statements[statement_type]
-            + text_statements[statement_type]
+        attachment_page_count = len(attachment_reader.pages)
+
+        attachment_native_text_pages = detect_statements(
+            attachment_reader
         )
 
-        combined_statements[statement_type] = sorted(
-            combined_pages
-        )
+    return PDFInspectionResult(
+        file_name=file_name,
+        page_count=page_count,
+        has_outline=has_outline,
+        native_text_pages=native_text_pages,
+        attachments=attachment_infos,
+        financial_statement_attachment=selected_attachment,
+        attachment_page_count=attachment_page_count,
+        attachment_native_text_pages=attachment_native_text_pages,
+    )
 
-    return {
-        "page_count": page_count,
-        "has_outline": bool(outline),
-        "outline": outline,
-        "outline_statements": outline_statements,
-        "text_statements": text_statements,
-        "statements": combined_statements,
-        "pages": pages,
-    }
+
+def print_inspection(result: PDFInspectionResult) -> None:
+    print()
+    print("=" * 70)
+    print("POLLUX PDF INSPECTION")
+    print("=" * 70)
+
+    print(f"File: {result.file_name}")
+    print(f"Pages: {result.page_count}")
+    print(f"Has bookmarks/outline: {result.has_outline}")
+
+    print()
+    print("OUTER PDF NATIVE TEXT DETECTION")
+    print("-" * 70)
+
+    for statement_type, pages in result.native_text_pages.items():
+        if pages:
+            print(f"{statement_type}: pages {pages}")
+        else:
+            print(f"{statement_type}: not detected")
+
+    print()
+    print("EMBEDDED ATTACHMENTS")
+    print("-" * 70)
+
+    if not result.attachments:
+        print("No embedded attachments detected.")
+    else:
+        for attachment in result.attachments:
+            pdf_status = "PDF" if attachment.is_pdf else "non-PDF"
+
+            print(
+                f"- {attachment.name} "
+                f"({attachment.size_bytes:,} bytes, {pdf_status})"
+            )
+
+    print()
+    print("FINANCIAL STATEMENT ATTACHMENT")
+    print("-" * 70)
+
+    if result.financial_statement_attachment:
+        print(
+            f"Selected: {result.financial_statement_attachment}"
+        )
+        print(
+            f"Pages: {result.attachment_page_count}"
+        )
+    else:
+        print("No financial statement attachment selected.")
+
+    print()
+    print("ATTACHED PDF NATIVE TEXT DETECTION")
+    print("-" * 70)
+
+    if result.financial_statement_attachment:
+
+        for statement_type, pages in (
+            result.attachment_native_text_pages.items()
+        ):
+            if pages:
+                print(
+                    f"{statement_type}: pages {pages}"
+                )
+            else:
+                print(
+                    f"{statement_type}: not detected"
+                )
+
+    print("=" * 70)
