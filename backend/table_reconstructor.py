@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
 from ocr import OCRResult
+from financial_numbers import FinancialNumber, parse_financial_number
 
 
 # ============================================================================
@@ -96,6 +97,14 @@ class ReconstructedRow:
     )
 
     previous_confidences: list[float] = field(
+        default_factory=list
+    )
+
+    current_numbers: list[FinancialNumber] = field(
+        default_factory=list
+    )
+
+    previous_numbers: list[FinancialNumber] = field(
         default_factory=list
     )
 
@@ -405,97 +414,87 @@ def _extract_year(
 def find_year_header_anchors(
     rows: Iterable[OCRRow],
 ) -> TableColumns | None:
+    """Detect the two adjacent financial years and the description anchor.
+
+    Year labels must occur on the same physical OCR row. "Particulars" may
+    occur on a neighboring header row because scanned documents frequently
+    split multi-line headers during OCR.
     """
-    Detect current and previous year column anchors.
-    """
+    all_rows = list(rows)
+    candidates = []
 
-    year_headers: list[
-        tuple[int, float, float]
-    ] = []
-
-    description_x: float | None = None
-
-    for row in rows:
-        for element, x_center in (
-            get_row_elements_with_positions(row)
-        ):
-            text = " ".join(
-                element.text.lower().split()
-            )
-
-            if "particulars" in text:
-                description_x = x_center
-
-            year = _extract_year(text)
-
+    for row in all_rows:
+        years = []
+        for element, x in get_row_elements_with_positions(row):
+            year = _extract_year(element.text)
             if year is not None:
-                year_headers.append(
-                    (
-                        year,
-                        x_center,
-                        get_y_center(element),
-                    )
-                )
+                years.append((year, element, x))
+        if len(years) < 2:
+            continue
+
+        years.sort(key=lambda item: item[2])
+        for i, left in enumerate(years):
+            for right in years[i + 1:]:
+                if abs(left[0] - right[0]) != 1:
+                    continue
+                separation = abs(left[2] - right[2])
+                if separation < MIN_COLUMN_SEPARATION:
+                    continue
+                confidence = float(left[1].confidence) + float(right[1].confidence)
+                candidates.append((confidence, row, left, right))
+
+    if not candidates:
+        return None
+
+    _, header_row, left, right = max(
+        candidates,
+        key=lambda item: item[0],
+    )
+
+    left_year, _, left_x = left
+    right_year, _, right_x = right
+
+    if left_year >= right_year:
+        current_year, current_x = left_year, left_x
+        previous_year, previous_x = right_year, right_x
+    else:
+        current_year, current_x = right_year, right_x
+        previous_year, previous_x = left_year, left_x
+
+    # "Particulars" is often on the row immediately above the date row.
+    description_x = None
+    for row in all_rows:
+        if abs(row.y_center - header_row.y_center) > 100.0:
+            continue
+        for element, x in get_row_elements_with_positions(row):
+            text = " ".join(element.text.lower().split())
+            if "particulars" in text:
+                description_x = x
+                break
+        if description_x is not None:
+            break
 
     if description_x is None:
-        description_x = DEFAULT_DESCRIPTION_X
+        # Use the left-most plausible header text before the numeric columns.
+        header_candidates = []
+        for row in all_rows:
+            if abs(row.y_center - header_row.y_center) > 100.0:
+                continue
+            for element, x in get_row_elements_with_positions(row):
+                text = element.text.strip()
+                if not text or _extract_year(text) is not None:
+                    continue
+                if is_numeric_candidate(text):
+                    continue
+                if x < min(current_x, previous_x):
+                    header_candidates.append(x)
+        if header_candidates:
+            description_x = min(header_candidates)
 
-    if not year_headers:
-        return None
-
-    unique_headers: list[
-        tuple[int, float, float]
-    ] = []
-
-    for year, x_center, y_center in year_headers:
-        duplicate = False
-
-        for (
-            existing_year,
-            existing_x,
-            existing_y,
-        ) in unique_headers:
-            if (
-                year == existing_year
-                and abs(
-                    x_center - existing_x
-                )
-                < 40.0
-                and abs(
-                    y_center - existing_y
-                )
-                < 40.0
-            ):
-                duplicate = True
-                break
-
-        if not duplicate:
-            unique_headers.append(
-                (
-                    year,
-                    x_center,
-                    y_center,
-                )
-            )
-
-    if len(unique_headers) < 2:
-        return None
-
-    current_year, current_x, _ = (
-        unique_headers[0]
-    )
-
-    previous_year, previous_x, _ = (
-        unique_headers[1]
-    )
-
-    if (
-        abs(
-            current_x - previous_x
-        )
-        < MIN_COLUMN_SEPARATION
-    ):
-        return None
+    if description_x is None:
+        # Financial statement descriptions are normally left of the first
+        # numeric column. Keep this as a last-resort geometric anchor.
+        description_x = max(0.0, min(current_x, previous_x) * 0.50)
 
     return TableColumns(
         description_x=description_x,
@@ -559,37 +558,24 @@ def normalize_numeric_text(
     text: str,
 ) -> str:
     """
-    Normalize common OCR formatting errors.
+    Normalize OCR financial-number formatting.
 
-    Example:
-
-        (1.014) -> (1,014)
-
-    The function remains conservative and does not
-    invent decimal precision.
+    Parentheses are preserved because they represent negative values.
+    Common OCR errors such as ``(1.014`` are normalized to ``(1,014)``.
     """
+    parsed = parse_financial_number(text)
 
+    if parsed is not None:
+        return parsed.normalized_text
+
+    # Preserve the previous conservative fallback for values that are
+    # recognized by the table classifier but rejected by the parser.
     value = text.strip()
 
-    value = value.replace(
-        "Rs.",
-        "",
-    ).strip()
-
-    value = value.replace(
-        "Rs",
-        "",
-    ).strip()
-
-    value = value.replace(
-        "[",
-        "(",
-    )
-
-    value = value.replace(
-        "]",
-        ")",
-    )
+    value = value.replace("Rs.", "", 1).strip()
+    value = value.replace("Rs", "", 1).strip()
+    value = value.replace("[", "(")
+    value = value.replace("]", ")")
 
     match = re.fullmatch(
         r"(\(?\s*[-+]?\s*\d{1,3})\.(\d{3})\s*\)?",
@@ -599,22 +585,19 @@ def normalize_numeric_text(
     if match:
         prefix = match.group(1)
         suffix = match.group(2)
-
         negative = value.startswith("(")
 
         normalized = (
             f"{prefix.replace('.', '')},{suffix}"
         )
 
-        if (
-            negative
-            and not normalized.startswith("(")
-        ):
-            normalized = (
-                f"({normalized})"
-            )
+        if negative and not normalized.startswith("("):
+            normalized = f"({normalized})"
 
         return normalized
+
+    if value.startswith("(") and not value.endswith(")"):
+        value += ")"
 
     return value
 
@@ -733,69 +716,82 @@ def classify_row(
     row: OCRRow,
     columns: TableColumns,
 ) -> ClassifiedRow:
+    """Classify OCR elements by financial table geometry.
+
+    Numeric-looking elements are assigned to the nearest year column.
+    Non-numeric elements remain description text. This also handles OCR
+    that accidentally places a number in the same OCR text line as a label.
     """
-    Separate one physical OCR row into:
-
-        description
-        current-year candidates
-        previous-year candidates
-
-    No numeric candidate is silently discarded.
-    """
-
-    description: list[OCRResult] = []
-
-    current_year: list[OCRResult] = []
-
-    previous_year: list[OCRResult] = []
+    description = []
+    current_year = []
+    previous_year = []
 
     for element in row.elements:
         text = element.text.strip()
-
         if not text:
             continue
 
         if is_numeric_candidate(text):
-            numeric_column = (
-                _classify_numeric_candidate(
-                    element,
-                    columns,
-                )
-            )
-
-            if (
-                numeric_column
-                == "current_year"
-            ):
-                current_year.append(
-                    element
-                )
+            numeric_column = _classify_numeric_candidate(element, columns)
+            if numeric_column == "current_year":
+                current_year.append(element)
+                continue
+            if numeric_column == "previous_year":
+                previous_year.append(element)
                 continue
 
-            if (
-                numeric_column
-                == "previous_year"
-            ):
-                previous_year.append(
-                    element
-                )
-                continue
-
-        description.append(
-            element
+        # Some OCR engines return "label 10,454" as one detection. Extract
+        # a trailing financial number without losing the label.
+        match = re.match(
+            r"^(.*?)(?:\\s+)([\\(\\[]?[-+]?\\d[\\d,./ ]*[\\)\\]]?)$",
+            text,
         )
+        if match and is_numeric_candidate(match.group(2)):
+            number_text = match.group(2)
+            label_text = match.group(1).strip()
+            numeric_column = _classify_numeric_candidate(element, columns)
+            if numeric_column == "current_year":
+                synthetic = OCRResult(
+                    text=number_text,
+                    confidence=element.confidence,
+                    bbox=element.bbox,
+                    page_number=element.page_number,
+                )
+                current_year.append(synthetic)
+                if label_text:
+                    description.append(
+                        OCRResult(
+                            text=label_text,
+                            confidence=element.confidence,
+                            bbox=element.bbox,
+                            page_number=element.page_number,
+                        )
+                    )
+                continue
+            if numeric_column == "previous_year":
+                synthetic = OCRResult(
+                    text=number_text,
+                    confidence=element.confidence,
+                    bbox=element.bbox,
+                    page_number=element.page_number,
+                )
+                previous_year.append(synthetic)
+                if label_text:
+                    description.append(
+                        OCRResult(
+                            text=label_text,
+                            confidence=element.confidence,
+                            bbox=element.bbox,
+                            page_number=element.page_number,
+                        )
+                    )
+                continue
 
-    description.sort(
-        key=get_x_start
-    )
+        description.append(element)
 
-    current_year.sort(
-        key=get_x_start
-    )
-
-    previous_year.sort(
-        key=get_x_start
-    )
+    description.sort(key=get_x_start)
+    current_year.sort(key=get_x_start)
+    previous_year.sort(key=get_x_start)
 
     return ClassifiedRow(
         y_center=row.y_center,
@@ -1262,6 +1258,105 @@ def _candidate_texts(
     )
 
 
+def _candidate_numbers(
+    elements: Sequence[OCRResult],
+) -> tuple[
+    list[str],
+    list[FinancialNumber],
+    list[float],
+]:
+    """
+    Deduplicate OCR numeric detections and parse them into typed
+    financial numbers.
+
+    The string representation is retained for diagnostics while the
+    FinancialNumber objects provide normalized numeric values and signs.
+    """
+    elements = _deduplicate_candidates(elements)
+
+    texts: list[str] = []
+    numbers: list[FinancialNumber] = []
+    confidences: list[float] = []
+
+    for element in elements:
+        parsed = parse_financial_number(
+            element.text,
+            confidence=float(element.confidence),
+        )
+
+        if parsed is None:
+            continue
+
+        texts.append(parsed.normalized_text)
+        numbers.append(parsed)
+        confidences.append(parsed.confidence)
+
+    return texts, numbers, confidences
+
+def remove_duplicate_numeric_rows(
+    rows: Sequence[ClassifiedRow],
+    max_y_gap: float = 35.0,
+) -> list[ClassifiedRow]:
+    """Remove a number-only OCR duplicate immediately following a real row."""
+    if not rows:
+        return []
+
+    cleaned = []
+    for row in rows:
+        if cleaned:
+            previous = cleaned[-1]
+            if (
+                not row.description
+                and previous.description
+                and _has_numeric_candidates(row)
+                and _has_numeric_candidates(previous)
+                and 0 <= row.y_center - previous.y_center <= max_y_gap
+            ):
+                current_a = sorted(numeric_value_key(x.text) for x in row.current_year)
+                current_b = sorted(numeric_value_key(x.text) for x in previous.current_year)
+                previous_a = sorted(numeric_value_key(x.text) for x in row.previous_year)
+                previous_b = sorted(numeric_value_key(x.text) for x in previous.previous_year)
+                if current_a == current_b and previous_a == previous_b:
+                    continue
+        cleaned.append(row)
+    return cleaned
+
+
+def _select_best_numeric_candidate(
+    elements: Sequence[OCRResult],
+    anchor_x: float,
+) -> OCRResult | None:
+    """Select the candidate closest to its expected numeric column."""
+    unique = _deduplicate_candidates(elements)
+    if not unique:
+        return None
+    return min(
+        unique,
+        key=lambda element: (
+            abs(get_x_center(element) - anchor_x),
+            -float(element.confidence),
+        ),
+    )
+
+
+def _selected_candidate_numbers(
+    elements: Sequence[OCRResult],
+    anchor_x: float,
+) -> tuple[list[str], list[FinancialNumber], list[float]]:
+    selected = _select_best_numeric_candidate(elements, anchor_x)
+    if selected is None:
+        return [], [], []
+
+    parsed = parse_financial_number(
+        selected.text,
+        confidence=float(selected.confidence),
+    )
+    if parsed is None:
+        return [], [], []
+
+    return [parsed.normalized_text], [parsed], [parsed.confidence]
+
+
 # ============================================================================
 # Complete reconstruction
 # ============================================================================
@@ -1310,6 +1405,12 @@ def reconstruct_rows(
         )
     )
 
+    classified_rows = (
+        remove_duplicate_numeric_rows(
+            classified_rows
+        )
+    )
+
     reconstructed: list[
         ReconstructedRow
     ] = []
@@ -1323,16 +1424,20 @@ def reconstruct_rows(
 
         (
             current_texts,
+            current_numbers,
             current_confidences,
-        ) = _candidate_texts(
-            row.current_year
+        ) = _selected_candidate_numbers(
+            row.current_year,
+            columns.current_year_x,
         )
 
         (
             previous_texts,
+            previous_numbers,
             previous_confidences,
-        ) = _candidate_texts(
-            row.previous_year
+        ) = _selected_candidate_numbers(
+            row.previous_year,
+            columns.previous_year_x,
         )
 
         reconstructed.append(
@@ -1341,6 +1446,8 @@ def reconstruct_rows(
                 description=description,
                 current_candidates=current_texts,
                 previous_candidates=previous_texts,
+                current_numbers=current_numbers,
+                previous_numbers=previous_numbers,
                 current_confidences=current_confidences,
                 previous_confidences=previous_confidences,
                 ambiguous_current=(
@@ -1431,27 +1538,42 @@ def format_reconstructed_row(
 ) -> str:
     """
     Format a reconstructed row for diagnostics.
+
+    Shows both normalized OCR strings and parsed numeric values.
     """
+    def format_numbers(
+        candidates: list[str],
+        numbers: list[FinancialNumber],
+    ) -> str:
+        if not numbers:
+            return "-"
 
-    current = ", ".join(
-        row.current_candidates
-    ) or "-"
+        parts: list[str] = []
 
-    previous = ", ".join(
-        row.previous_candidates
-    ) or "-"
+        for candidate, number in zip(candidates, numbers):
+            parts.append(
+                f"{candidate} -> {number.numeric_value}"
+            )
+
+        return ", ".join(parts)
+
+    current = format_numbers(
+        row.current_candidates,
+        row.current_numbers,
+    )
+
+    previous = format_numbers(
+        row.previous_candidates,
+        row.previous_numbers,
+    )
 
     flags: list[str] = []
 
     if row.ambiguous_current:
-        flags.append(
-            "AMBIGUOUS_CURRENT"
-        )
+        flags.append("AMBIGUOUS_CURRENT")
 
     if row.ambiguous_previous:
-        flags.append(
-            "AMBIGUOUS_PREVIOUS"
-        )
+        flags.append("AMBIGUOUS_PREVIOUS")
 
     flag_text = (
         f" [{', '.join(flags)}]"
@@ -1467,3 +1589,4 @@ def format_reconstructed_row(
         f"| PREVIOUS={previous}"
         f"{flag_text}"
     )
+
