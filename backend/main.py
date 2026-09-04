@@ -1,4 +1,5 @@
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from file_validator import (
@@ -19,6 +20,16 @@ app = FastAPI(
     title=settings.app_name,
     description="Cash Flow Statement Extraction API",
     version=settings.app_version,
+)
+
+
+# Allow requests from the local React/Vite frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
