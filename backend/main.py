@@ -1,23 +1,26 @@
 from fastapi import FastAPI
 
+from config import settings
+from schemas import HealthResponse, RootResponse
+
 app = FastAPI(
-    title="Pollux",
+    title=settings.app_name,
     description="Cash Flow Statement Extraction API",
-    version="0.1.0",
+    version=settings.app_version,
 )
 
 
-@app.get("/")
+@app.get("/", response_model=RootResponse)
 def root():
-    return {
-        "name": "Pollux",
-        "status": "running",
-        "version": "0.1.0",
-    }
+    return RootResponse(
+        name=settings.app_name,
+        status="running",
+        version=settings.app_version,
+    )
 
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 def health():
-    return {
-        "status": "healthy"
-    }
+    return HealthResponse(
+        status="healthy"
+    )
