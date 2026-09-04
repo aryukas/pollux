@@ -58,6 +58,9 @@ output/
 # Local test files
 # ================================
 backend/test.pdf
+backend/ocr_test.png
+backend/cash_flow_page.png
+backend/page_thumbnails/
 
 # ================================
 # Generated files
